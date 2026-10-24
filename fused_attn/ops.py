@@ -33,6 +33,29 @@ except Exception:  # pragma: no cover
     _HAS_TRITON = False
 
 BACKENDS = ("cuda_mma", "cuda", "triton", "splitk", "reference")
+_TUNED_PATH = os.path.join(os.path.dirname(__file__), "tuned_configs.json")
+_tuned: dict | None = None
+
+
+def simt_config_for(dtype: torch.dtype, head_dim: int, seqlen_k: int) -> int:
+    """Tile configuration id for the SIMT kernel, from benchmarks/tune.py results (0 = default)."""
+    global _tuned
+    if _tuned is None:
+        try:
+            import json
+
+            with open(_TUNED_PATH) as f:
+                _tuned = json.load(f)
+        except Exception:
+            _tuned = {}
+    table = _tuned.get("simt", {}).get(f"{str(dtype).replace('torch.', '')}/{head_dim}")
+    if not table:
+        return 0
+    # buckets are upper bounds on seqlen_k, sorted ascending
+    for bucket, cfg in sorted(((int(b), c) for b, c in table.items()), key=lambda x: x[0]):
+        if seqlen_k <= bucket:
+            return int(cfg)
+    return int(table[str(max(int(b) for b in table))])
 SPLITK_MAX_Q = 16          # decode-shaped: few query rows ...
 SPLITK_MIN_K = 2048        # ... against a long context
 
@@ -91,7 +114,7 @@ def attention(
     if backend == "cuda_mma":
         return _cuda_ext.attention_fwd_mma(q, k, v, causal, scale)
     if backend == "cuda":
-        return _cuda_ext.attention_fwd(q, k, v, causal, scale)
+        return _cuda_ext.attention_fwd(q, k, v, causal, scale, simt_config_for(q.dtype, q.shape[-1], k.shape[-2]))
     if backend == "splitk":
         return attention_splitk_triton(q, k, v, causal=causal, scale=scale)
     if backend == "triton":

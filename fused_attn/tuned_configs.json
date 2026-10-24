@@ -1,0 +1,5 @@
+{
+  "_comment": "Written by benchmarks/tune.py. simt: dtype/head_dim -> {max_seqlen_k: config_id}. triton: shape -> best (BLOCK_M, BLOCK_N, num_warps, num_stages). Default (0) until you run the tuner on your GPU.",
+  "simt": {},
+  "triton": {}
+}
