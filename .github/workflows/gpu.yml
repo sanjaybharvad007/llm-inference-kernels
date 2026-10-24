@@ -12,3 +12,11 @@ jobs:
       - run: pytest -q
       - run: python benchmarks/bench.py --seqlens 512 2048 --causal --out /tmp/bench.csv
       - run: python benchmarks/bench_decode.py --ctx 4096 16384
+      - run: python benchmarks/bench_kv8.py --ctx 2048 8192
+      - run: python benchmarks/bench_vs_torch.py --batches 1 8 --seqlens 1024 4096 --causal --out results/vs_torch.csv
+      - run: python benchmarks/tune.py --dtype bfloat16 --seqlens 1024 4096 --causal --no-write
+      - name: TensorRT plugin (if TensorRT is installed on the runner)
+        run: |
+          if python -c "import tensorrt" 2>/dev/null; then
+            cmake -S trt -B trt/build && cmake --build trt/build -j && python trt/build_engine.py --batch 2 --seqlen 1024 --causal
+          else echo "tensorrt not installed; skipping"; fi

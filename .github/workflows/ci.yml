@@ -19,3 +19,5 @@ jobs:
         env: { FUSED_ATTN_SKIP_CUDA: "1" }
       - run: ruff check .
       - run: TRITON_INTERPRET=1 pytest -q -rfE --tb=short
+      - name: type-check the KV-cache CUDA kernels without a GPU (host stub)
+        run: g++ -fsyntax-only -std=c++17 -Wall -Werror -Wno-unknown-pragmas -Wno-unused-variable -x c++ -Icsrc -Icsrc/host_stub -include csrc/host_stub/cuda_host_stub.h csrc/kv_cache.cu

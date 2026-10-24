@@ -1,11 +1,13 @@
 # cuda-attention-kernels
 
-**Fused multi-head attention for LLM inference: a Tensor-Core CUDA C++ kernel, a SIMT CUDA C++ kernel, autotuned Triton kernels, split-K flash-decoding and an FP8 KV-cache path, behind one `torch.library` op.**
+**CUDA kernels for LLM inference: fused attention with Tensor-Core matmul (`mma.sync`), a tunable SIMT kernel, autotuned Triton kernels, split-K flash-decoding, an INT8/FP8 KV cache with dequantisation fused into decode attention, a TensorRT plugin, and an Nsight-driven tuning workflow — all behind one `torch.library` op and benchmarked against PyTorch across batch sizes and sequence lengths.**
 
 [![CI](https://github.com/sanjaybharvad007/cuda-attention-kernels/actions/workflows/ci.yml/badge.svg)](https://github.com/sanjaybharvad007/cuda-attention-kernels/actions/workflows/ci.yml)
 [![GPU tests](https://github.com/sanjaybharvad007/cuda-attention-kernels/actions/workflows/gpu.yml/badge.svg)](https://github.com/sanjaybharvad007/cuda-attention-kernels/actions/workflows/gpu.yml)
 ![CUDA](https://img.shields.io/badge/CUDA-12.x%20%7C%20sm__80%2B-76B900)
 ![Triton](https://img.shields.io/badge/Triton-3.x-blue)
+![TensorRT](https://img.shields.io/badge/TensorRT-10%20plugin-76B900)
+![Nsight](https://img.shields.io/badge/Nsight-Compute%20%7C%20Systems-76B900)
 ![PyTorch](https://img.shields.io/badge/PyTorch-2.4%2B-ee4c2c)
 ![Python](https://img.shields.io/badge/Python-3.10%2B-3776ab)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
@@ -43,10 +45,14 @@ The same attention kernel is written three times at three levels of the stack, s
 - **Tensor-Core kernel in CUDA C++** (`csrc/flash_attn_mma.cu`): `mma.sync.m16n8k16` fragments, `ldmatrix` / `ldmatrix.trans` fragment loads, `cp.async` double-buffered K/V tiles, padded bank-conflict-free shared memory, probabilities kept in registers between the QK and PV MMAs.
 - **SIMT kernel in CUDA C++** (`csrc/flash_attn.cu`): fp32 FMA, 16-byte vector loads, double-buffered tiles; a readable baseline for profiling and for architectures without Tensor Cores.
 - **Autotuned Triton kernels** (`fused_attn/`): dense, variable-length (`cu_seqlens`) and split-K flash-decoding with a log-sum-exp combine kernel; run on CPU under `TRITON_INTERPRET=1`, which is what CI uses.
-- **FP8 (E4M3) KV cache** with per-64-key block scales, dequantised inside the kernel (sm_89+).
+- **KV-cache optimisation** (`csrc/kv_cache.cu`): paged INT8 cache with per-token scales (1.9x fewer bytes than fp16), quantisation fused into the cache write, and a split-K decode kernel that dequantises inside the dot product with fp32 accumulation (mixed precision end to end); plus the FP8 (E4M3) KV path in Triton with per-64-key block scales (sm_89+).
+- **Memory-hierarchy tuning**: five SIMT tile configurations (`BLOCK_M × BLOCK_N`, threads, static shared memory) selectable at launch, measured by `benchmarks/tune.py` and chosen per shape from `fused_attn/tuned_configs.json`; padded shared-memory rows and `cp.async` staging in the Tensor-Core kernel.
+- **Nsight-based analysis**: `scripts/profile_ncu.sh` / `profile_nsys.sh` plus `scripts/ncu_summary.py`, which reduces a Nsight Compute report to the metrics that decide the next change (DRAM/SM/Tensor-pipe utilisation, occupancy and its limiter, bank conflicts, sector efficiency, arithmetic intensity) and prints a diagnosis. [`docs/profiling.md`](docs/profiling.md) records what each measurement changed.
+- **TensorRT plugin** (`trt/`): `FusedAttention` IPluginV3 (TensorRT 10) wrapping the kernels with no PyTorch dependency; `trt/build_engine.py` builds an engine, validates it against the fp32 reference and times it against TensorRT's own fused attention.
+- **Benchmarked against the PyTorch baseline** across batch sizes × sequence lengths: `benchmarks/bench_vs_torch.py` (flash / mem-efficient / math SDPA), speed-up heatmaps from `plot_vs_torch.py`.
 - **Online softmax in base 2**: `exp2` with `log2(e)` folded into the softmax scale, so the inner loop has no multiply before the exponential.
 - **One public op**: `fused_attn::attention` is a `torch.library` custom op with a fake kernel, so it traces through `torch.compile(fullgraph=True)`; dispatch picks the fastest available backend per call.
-- **121 tests** against an unfused PyTorch reference, including ragged tails, `n_q != n_k`, single-token decode, GQA/MQA ratios, non-contiguous `[B,N,H,D]` layouts and zero-length sequences in a packed batch.
+- **130+ tests** against an unfused PyTorch reference, including ragged tails, `n_q != n_k`, single-token decode, GQA/MQA ratios, non-contiguous `[B,N,H,D]` layouts and zero-length sequences in a packed batch.
 
 ## Architecture
 
@@ -162,6 +168,9 @@ python benchmarks/bench.py --seqlens 512 1024 2048 4096 8192 16384 \
     --heads 32 --kv-heads 8 --head-dim 128 --causal --dtype bf16 --out results.csv
 python benchmarks/plot.py results.csv
 python benchmarks/bench_decode.py --ctx 4096 16384 65536            # single-pass vs split-K vs FP8-KV
+python benchmarks/bench_kv8.py --ctx 2048 8192 32768                # fp16 split-K vs INT8 paged KV decode, GB/s
+python benchmarks/bench_vs_torch.py --batches 1 4 16 --seqlens 512 1024 2048 4096 8192 --causal --out results/vs_torch.csv
+python benchmarks/plot_vs_torch.py results/vs_torch.csv             # speed-up heatmaps vs torch flash
 ```
 
 The harness reports latency, achieved TFLOP/s and maximum absolute error against an fp32 reference for `fused_attn/cuda_mma`, `fused_attn/cuda`, `fused_attn/triton`, `torch.sdpa` and `flash_attn` when installed. Numbers below are the template the harness fills in; measure on your own hardware and paste them here.
@@ -193,35 +202,45 @@ Every kernel is compared with an unfused PyTorch reference that is itself checke
 ## Profiling
 
 ```bash
-bash scripts/profile_ncu.sh 4096 cuda_mma      # writes ncu_cuda_mma_4096.ncu-rep and a metric summary
+bash scripts/profile_ncu.sh 4096 cuda_mma           # Nsight Compute, full section set
+python scripts/ncu_summary.py ncu_cuda_mma_4096.ncu-rep   # the metrics that matter + a diagnosis per kernel
+bash scripts/profile_nsys.sh cuda_mma 4096          # Nsight Systems timeline
+python benchmarks/tune.py --dtype bf16 --causal     # sweep SIMT tile configs, write fused_attn/tuned_configs.json
 ```
+
+[`docs/profiling.md`](docs/profiling.md) walks through the measurement-driven iterations (double buffering, two lanes per row, tile configs, padded `ldmatrix` rows, split-K, INT8 KV) and [`docs/tuning.md`](docs/tuning.md) the block / grid / shared-memory trade-offs.
 
 Metrics worth reading: `smsp__sass_average_data_bytes_per_sector_mem_global` (coalescing), `l1tex__data_bank_conflicts_pipe_lsu_mem_shared` (shared-memory conflicts), achieved occupancy, and Tensor-pipe utilisation (`sm__pipe_tensor_cycles_active`).
 
 ## Repository layout
 
 ```
-fused_attn/        reference.py        unfused PyTorch reference
+fused_attn/        kv_cache.py         INT8 paged KV cache: quantise / append / decode (torch reference + CUDA dispatch)
+                   tuned_configs.json  per-shape SIMT tile choices written by benchmarks/tune.py
+                   reference.py        unfused PyTorch reference
                    triton_fwd.py       dense + varlen FlashAttention-2 kernel, autotuned
                    triton_splitk.py    split-K flash-decoding + LSE combine kernel
                    fp8.py              E4M3 KV quantisation and FP8-KV attention kernel
                    ops.py              torch.library op, fake kernel, backend dispatch
-csrc/              flash_attn_mma.cu   Tensor-Core kernel (mma.sync, ldmatrix, cp.async)
+csrc/              kv_cache.cu/.h      INT8 quantise, paged append, split-K decode over int8 KV (+ combine)
+                   host_stub/          plain-C++ stand-ins so kernels type-check in CI without nvcc
+                   flash_attn_mma.cu   Tensor-Core kernel (mma.sync, ldmatrix, cp.async)
                    flash_attn.cu       SIMT kernel
                    ptx.cuh             PTX wrappers: mma, ldmatrix, cp.async
                    flash_attn.h        bindings.cpp
 tests/             test_correctness.py  test_varlen.py  test_splitk_fp8.py  test_torch_compile.py
-benchmarks/        bench.py  bench_decode.py  plot.py
-docs/              tensor_core_kernel.md
-scripts/           profile_ncu.sh
+trt/               fused_attention_plugin.{h,cpp}  CMakeLists.txt  build_engine.py   TensorRT 10 IPluginV3
+benchmarks/        bench.py  bench_decode.py  bench_kv8.py  bench_vs_torch.py  plot_vs_torch.py  tune.py  plot.py
+docs/              tensor_core_kernel.md  kv_cache_quantization.md  profiling.md  tuning.md
+scripts/           profile_ncu.sh  profile_nsys.sh  ncu_summary.py
 .github/workflows  ci.yml (CPU, Triton interpreter)  gpu.yml (manual, GPU runner)
 ```
 
 ## Roadmap
 
+- INT4 KV cache with group-wise scales
 - Backward pass (recompute-based, FlashAttention-2 style) for the Triton kernel
 - Hopper path: `wgmma` + TMA for the Tensor-Core kernel
-- Paged (block-table) K/V for the decode kernels
 - Sliding-window and ALiBi masks
 
 ## References
