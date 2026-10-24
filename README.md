@@ -1,9 +1,9 @@
-# cuda-attention-kernels
+# llm-inference-kernels
 
 **CUDA kernels for LLM inference: fused attention with Tensor-Core matmul (`mma.sync`), a tunable SIMT kernel, autotuned Triton kernels, split-K flash-decoding, an INT8/FP8 KV cache with dequantisation fused into decode attention, a TensorRT plugin, and an Nsight-driven tuning workflow — all behind one `torch.library` op and benchmarked against PyTorch across batch sizes and sequence lengths.**
 
-[![CI](https://github.com/sanjaybharvad007/cuda-attention-kernels/actions/workflows/ci.yml/badge.svg)](https://github.com/sanjaybharvad007/cuda-attention-kernels/actions/workflows/ci.yml)
-[![GPU tests](https://github.com/sanjaybharvad007/cuda-attention-kernels/actions/workflows/gpu.yml/badge.svg)](https://github.com/sanjaybharvad007/cuda-attention-kernels/actions/workflows/gpu.yml)
+[![CI](https://github.com/sanjaybharvad007/llm-inference-kernels/actions/workflows/ci.yml/badge.svg)](https://github.com/sanjaybharvad007/llm-inference-kernels/actions/workflows/ci.yml)
+[![GPU tests](https://github.com/sanjaybharvad007/llm-inference-kernels/actions/workflows/gpu.yml/badge.svg)](https://github.com/sanjaybharvad007/llm-inference-kernels/actions/workflows/gpu.yml)
 ![CUDA](https://img.shields.io/badge/CUDA-12.x%20%7C%20sm__80%2B-76B900)
 ![Triton](https://img.shields.io/badge/Triton-3.x-blue)
 ![TensorRT](https://img.shields.io/badge/TensorRT-10%20plugin-76B900)
@@ -100,8 +100,8 @@ Dispatch order is `cuda_mma -> cuda -> triton -> reference`, with decode-shaped 
 ## Installation
 
 ```bash
-git clone https://github.com/sanjaybharvad007/cuda-attention-kernels
-cd cuda-attention-kernels
+git clone https://github.com/sanjaybharvad007/llm-inference-kernels
+cd llm-inference-kernels
 pip install setuptools wheel
 pip install -e . --no-build-isolation                           # builds csrc/ when nvcc is on PATH
 FUSED_ATTN_SKIP_CUDA=1 pip install -e . --no-build-isolation    # Triton-only install
