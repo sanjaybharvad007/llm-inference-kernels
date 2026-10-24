@@ -17,7 +17,7 @@ try:
         ext_modules.append(
             CUDAExtension(
                 name="fused_attn._C",
-                sources=["csrc/bindings.cpp", "csrc/flash_attn.cu", "csrc/flash_attn_mma.cu"],
+                sources=["csrc/bindings.cpp", "csrc/flash_attn.cu", "csrc/flash_attn_mma.cu", "csrc/kv_cache.cu"],
                 include_dirs=[os.path.abspath("csrc")],
                 extra_compile_args={"cxx": ["-O3", "-std=c++17"], "nvcc": nvcc},
             )
@@ -28,7 +28,7 @@ except ImportError:
 
 setup(
     name="fused-attn",
-    version="0.2.0",
+    version="0.4.0",
     packages=find_packages(exclude=("tests", "benchmarks")),
     ext_modules=ext_modules,
     cmdclass=cmdclass,
