@@ -186,20 +186,44 @@ attn_fwd_kernel(const T* __restrict__ Q, const T* __restrict__ K,
   for (int i = 0; i < D_HALF; ++i) o_ptr[i] = Cvt<T>::from_f32(acc[i] * inv_l);
 }
 
+// ---- tile configurations ----------------------------------------------------
+// The kernel is templated on (BLOCK_M, BLOCK_N).  Which pair is fastest depends
+// on the shape: more rows per block (BLOCK_M) amortise each K/V tile load over
+// more queries but cut the number of blocks (bad for short sequences / small
+// batches); wider tiles (BLOCK_N) halve the number of __syncthreads per key
+// but cost registers (s[BLOCK_N]) and shared memory.  benchmarks/tune.py
+// measures them and ops.py picks per shape.  Only configurations whose static
+// shared memory fits in 48 KB are instantiated.
+template <typename T, int HEAD_DIM, int BLOCK_M, int BLOCK_N>
+constexpr int smem_bytes_for() { return 2 * 2 * BLOCK_N * HEAD_DIM * (int)sizeof(T); }
+
+template <typename T, int HEAD_DIM, int BLOCK_M, int BLOCK_N, bool IS_CAUSAL>
+void launch_cfg(const AttnParams& p, cudaStream_t stream) {
+  if constexpr (smem_bytes_for<T, HEAD_DIM, BLOCK_M, BLOCK_N>() <= 48 * 1024 && BLOCK_N * HEAD_DIM <= 4096) {  // s[BLOCK_N] register budget
+    dim3 grid((p.seqlen_q + BLOCK_M - 1) / BLOCK_M, p.batch * p.num_heads_q);
+    dim3 block(BLOCK_M * 2);
+    attn_fwd_kernel<T, HEAD_DIM, BLOCK_M, BLOCK_N, IS_CAUSAL><<<grid, block, 0, stream>>>(
+        static_cast<const T*>(p.q), static_cast<const T*>(p.k), static_cast<const T*>(p.v),
+        static_cast<T*>(p.o),
+        p.q_batch_stride, p.q_head_stride, p.q_row_stride,
+        p.k_batch_stride, p.k_head_stride, p.k_row_stride,
+        p.v_batch_stride, p.v_head_stride, p.v_row_stride,
+        p.o_batch_stride, p.o_head_stride, p.o_row_stride,
+        p.num_heads_q, p.num_heads_kv, p.seqlen_q, p.seqlen_k, p.scale);
+  } else {
+    launch_cfg<T, HEAD_DIM, 64, 32, IS_CAUSAL>(p, stream);  // fall back to the default tile
+  }
+}
+
 template <typename T, int HEAD_DIM, bool IS_CAUSAL>
 void launch(const AttnParams& p, cudaStream_t stream) {
-  constexpr int BLOCK_M = 64;
-  constexpr int BLOCK_N = 32;
-  dim3 grid((p.seqlen_q + BLOCK_M - 1) / BLOCK_M, p.batch * p.num_heads_q);
-  dim3 block(BLOCK_M * 2);
-  attn_fwd_kernel<T, HEAD_DIM, BLOCK_M, BLOCK_N, IS_CAUSAL><<<grid, block, 0, stream>>>(
-      static_cast<const T*>(p.q), static_cast<const T*>(p.k), static_cast<const T*>(p.v),
-      static_cast<T*>(p.o),
-      p.q_batch_stride, p.q_head_stride, p.q_row_stride,
-      p.k_batch_stride, p.k_head_stride, p.k_row_stride,
-      p.v_batch_stride, p.v_head_stride, p.v_row_stride,
-      p.o_batch_stride, p.o_head_stride, p.o_row_stride,
-      p.num_heads_q, p.num_heads_kv, p.seqlen_q, p.seqlen_k, p.scale);
+  switch (p.config) {
+    case 1:  launch_cfg<T, HEAD_DIM, 128, 32, IS_CAUSAL>(p, stream); break;   // more rows per tile load
+    case 2:  launch_cfg<T, HEAD_DIM, 64, 64, IS_CAUSAL>(p, stream); break;    // wider key tiles (D=64)
+    case 3:  launch_cfg<T, HEAD_DIM, 32, 32, IS_CAUSAL>(p, stream); break;    // more blocks for short sequences
+    case 4:  launch_cfg<T, HEAD_DIM, 32, 64, IS_CAUSAL>(p, stream); break;
+    default: launch_cfg<T, HEAD_DIM, 64, 32, IS_CAUSAL>(p, stream); break;
+  }
 }
 
 template <typename T, int HEAD_DIM>
@@ -218,6 +242,18 @@ void dispatch_headdim(const AttnParams& p, cudaStream_t s) {
 }
 
 }  // namespace
+
+int simt_configs(int head_dim, int elem_size, SimtConfig* out, int max_out) {
+  const int cand[5][3] = {{0, 64, 32}, {1, 128, 32}, {2, 64, 64}, {3, 32, 32}, {4, 32, 64}};
+  int n = 0;
+  for (const auto& c : cand) {
+    const int smem = 2 * 2 * c[2] * head_dim * elem_size;
+    if (smem > 48 * 1024 || c[2] * head_dim > 4096) continue;
+    if (n < max_out) out[n] = SimtConfig{c[0], c[1], c[2], c[1] * 2, smem};
+    ++n;
+  }
+  return n;
+}
 
 void run_attention_fwd(const AttnParams& p, cudaStream_t stream) {
   switch (p.dtype) {

@@ -19,7 +19,20 @@ struct AttnParams {
   float scale;
   bool causal;
   DType dtype;
+  /** SIMT kernel tile configuration id (0 = default). See simt_configs(). */
+  int config = 0;
 };
+
+/** One launch configuration of the SIMT kernel: how the work is cut into blocks/warps/shared memory. */
+struct SimtConfig {
+  int id;
+  int block_m;      // query rows per thread block
+  int block_n;      // keys per shared-memory tile
+  int threads;      // threads per block (= block_m * 2)
+  int smem_bytes;   // static shared memory (double-buffered K and V tiles)
+};
+/** Configurations available for a head_dim / element size (static smem <= 48 KB, register budget respected). */
+int simt_configs(int head_dim, int elem_size, SimtConfig* out, int max_out);
 
 // SIMT kernel (fp16 / bf16 / fp32, head_dim 64/128, any arch)
 void run_attention_fwd(const AttnParams& p, cudaStream_t stream);
